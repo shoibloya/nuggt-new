@@ -63,9 +63,7 @@ export default function LoginPage() {
             </Button>
           </form>
         </CardContent>
-        <CardFooter>
-          <p className="text-xs text-muted-foreground">Demo auth using Firebase Realtime Database.</p>
-        </CardFooter>
+        
       </Card>
     </div>
   );
