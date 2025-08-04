@@ -16,7 +16,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Nuggt Demo Dashboard",
+  title: "Nuggt Demo",
   description: "Nuggt Copyright 2025",
 };
 
