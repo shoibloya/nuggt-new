@@ -1,4 +1,5 @@
 // app/api/create-user/route.ts
+/* 
 import { NextResponse } from "next/server";
 import { rtdb } from "@/lib/firebase-admin";
 
@@ -15,3 +16,4 @@ export async function POST(req: Request) {
   await rtdb.ref(`auth/users/${username}`).set({ password });
   return NextResponse.json({ ok: true });
 }
+*/

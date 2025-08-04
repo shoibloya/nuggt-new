@@ -1,4 +1,5 @@
 // app/api/login/route.ts
+/*
 import { NextResponse } from "next/server";
 import { rtdb } from "@/lib/firebase-admin";
 
@@ -27,3 +28,4 @@ export async function POST(req: Request) {
   });
   return res;
 }
+*/
