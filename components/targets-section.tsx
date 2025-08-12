@@ -23,20 +23,29 @@ import {
   CheckCircle,
   Clock,
   Pencil,
+  Lock,
+  KeyRound,
+  ImagePlus,
 } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Label } from "@/components/ui/label"
+import { Textarea } from "@/components/ui/textarea"
 
 // Firebase
-import { db } from "@/lib/firebase"
+import { db, storage } from "@/lib/firebase"
 import { ref, get, update } from "firebase/database"
+import { getDownloadURL, ref as storageRef, uploadBytes } from "firebase/storage"
 
 /* ---------- constants ---------- */
 const MAX_REQUESTED = 4
 const ITEMS_PER_PAGE = 20
+const DEFAULT_OUTLINE_IMAGE = "/blog-outline.png"
+const EDIT_PASSWORD = "0000"
 
 /* ---------- helpers ---------- */
 const safeKey = (s: string) => s.replace(/[.#$/\[\]]/g, "_")
@@ -55,6 +64,22 @@ type RequestedItem = {
   readTime?: string
   url?: string
   status?: "pending" | "published"
+}
+
+type BlogPostCard = {
+  key: string
+  id: number
+  title: string
+  excerpt: string
+  imageUrl: string
+  date: string
+  readTime: string
+  url: string
+  status: "pending" | "published"
+}
+
+type BlogEditableFields = Pick<BlogPostCard, "id" | "title" | "excerpt" | "imageUrl" | "date" | "readTime" | "url" | "status"> & {
+  key: string
 }
 
 const container = { hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.1 } } }
@@ -245,7 +270,7 @@ export default function TargetsSection() {
         updates[`${k}/id`] = idx + 1
         updates[`${k}/title`] = r.keyword // no truncation
         updates[`${k}/excerpt`] = "Blog outline"
-        updates[`${k}/imageUrl`] = "/blog-outline.png"
+        updates[`${k}/imageUrl`] = DEFAULT_OUTLINE_IMAGE
         updates[`${k}/date`] = scheduleDates[idx]
         updates[`${k}/readTime`] = "N/A"
         updates[`${k}/url`] = "#"
@@ -267,7 +292,7 @@ export default function TargetsSection() {
                 id: (keywords.indexOf(r.keyword) ?? 0) + 1,
                 title: r.keyword,
                 excerpt: "Blog outline",
-                imageUrl: "/blog-outline.png",
+                imageUrl: DEFAULT_OUTLINE_IMAGE,
                 date: scheduleDates[keywords.indexOf(r.keyword)],
                 readTime: "N/A",
                 url: "#",
@@ -339,6 +364,13 @@ export default function TargetsSection() {
   const now = Date.now()
   const lockedByMonth = lockUntil ? now < lockUntil : false
 
+  // When a BlogCard saves changes, reflect them locally
+  const handleCardUpdated = (updated: BlogEditableFields) => {
+    setRequested((prev) =>
+      prev.map((r) => (safeKey(r.keyword) === updated.key ? { ...r, ...updated } : r)),
+    )
+  }
+
   return (
     <div className="space-y-6">
       {/* ---------- TOP: Cards UI shown only AFTER submission exists (any submitted item) ---------- */}
@@ -365,17 +397,19 @@ export default function TargetsSection() {
                     .map((r, idx) => (
                       <BlogCard
                         key={r.keyword + idx}
+                        username={username}
                         post={{
                           key: safeKey(r.keyword),
                           id: r.id ?? idx + 1,
                           title: r.title ?? r.keyword, // no truncation
                           excerpt: r.excerpt ?? "Blog outline",
-                          imageUrl: r.imageUrl ?? "/blog-outline.png",
+                          imageUrl: r.imageUrl ?? DEFAULT_OUTLINE_IMAGE,
                           date: r.date ?? "",
                           readTime: r.readTime ?? "N/A",
                           url: r.url ?? "#",
                           status: r.status ?? "pending",
                         }}
+                        onUpdated={handleCardUpdated}
                       />
                     ))}
                 </div>
@@ -456,8 +490,7 @@ export default function TargetsSection() {
                   <AlertDescription className="text-red-800 dark:text-red-200">
                     {lockedByMonth ? (
                       <>
-                        <strong>Requests locked.</strong> You can request new blogs after{" "}
-                        {lockUntil ? new Date(lockUntil).toLocaleDateString() : "next month"}.
+                        <strong>Requests locked.</strong> You can request new blogs after {lockUntil ? new Date(lockUntil).toLocaleDateString() : "next month"}.
                       </>
                     ) : (
                       <>
@@ -561,7 +594,7 @@ export default function TargetsSection() {
                       : "Mark queries as Targeted in Analysis, Competitors, or Performance to see them here."}
                   </p>
                   {searchQuery && (
-                    <Button variant="outline" onClick={() => setSearchQuery("")}>
+                    <Button variant="outline" onClick={() => setSearchQuery("")}> 
                       Clear Search
                     </Button>
                   )}
@@ -579,9 +612,7 @@ export default function TargetsSection() {
                   {totalPages > 1 && (
                     <div className="flex items-center justify-between pt-4 border-t">
                       <div className="text-sm text-muted-foreground">
-                        Showing {(currentPage - 1) * ITEMS_PER_PAGE + 1} to{" "}
-                        {Math.min(currentPage * ITEMS_PER_PAGE, availableTargets.length)} of {availableTargets.length}{" "}
-                        keywords
+                        Showing {(currentPage - 1) * ITEMS_PER_PAGE + 1} to {Math.min(currentPage * ITEMS_PER_PAGE, availableTargets.length)} of {availableTargets.length} keywords
                       </div>
                       <div className="flex items-center gap-2">
                         <Button
@@ -775,22 +806,113 @@ export default function TargetsSection() {
   )
 }
 
-/* ---------- Blog Card (no truncation on title) ---------- */
+/* ---------- Blog Card (editable + password protected + upload or default image + read more link) ---------- */
 function BlogCard({
   post,
+  username,
+  onUpdated,
 }: {
-  post: {
-    key: string
-    id: number
-    title: string
-    excerpt: string
-    imageUrl: string
-    date: string
-    readTime: string
-    url: string
-    status: "pending" | "published"
-  }
+  post: BlogPostCard
+  username: string
+  onUpdated: (updated: BlogEditableFields) => void
 }) {
+  const [open, setOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  // Password gate
+  const [authPass, setAuthPass] = useState("")
+  const [authed, setAuthed] = useState(false)
+  const [authError, setAuthError] = useState("")
+
+  // Image upload state
+  const [uploading, setUploading] = useState(false)
+  const [imageMode, setImageMode] = useState<"default" | "upload">(
+    post.imageUrl && post.imageUrl !== DEFAULT_OUTLINE_IMAGE ? "upload" : "default",
+  )
+
+  const [form, setForm] = useState<BlogEditableFields>({
+    key: post.key,
+    id: post.id,
+    title: post.title,
+    excerpt: post.excerpt,
+    imageUrl: post.imageUrl,
+    date: post.date,
+    readTime: post.readTime,
+    url: post.url,
+    status: post.status,
+  })
+
+  useEffect(() => {
+    setForm({
+      key: post.key,
+      id: post.id,
+      title: post.title,
+      excerpt: post.excerpt,
+      imageUrl: post.imageUrl,
+      date: post.date,
+      readTime: post.readTime,
+      url: post.url,
+      status: post.status,
+    })
+    setImageMode(post.imageUrl && post.imageUrl !== DEFAULT_OUTLINE_IMAGE ? "upload" : "default")
+    setAuthed(false)
+    setAuthPass("")
+    setAuthError("")
+  }, [post, open])
+
+  const handleChange = (field: keyof BlogEditableFields, value: any) => {
+    setForm((prev) => ({ ...prev, [field]: value }))
+  }
+
+  const tryUnlock = () => {
+    if (authPass === EDIT_PASSWORD) {
+      setAuthed(true)
+      setAuthError("")
+    } else {
+      setAuthError("Incorrect password")
+    }
+  }
+
+  const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+    try {
+      const path = `analyticsDashaboard/${username}/requestedBlogs/${post.key}/${Date.now()}_${file.name}`
+      const sref = storageRef(storage, path)
+      await uploadBytes(sref, file)
+      const url = await getDownloadURL(sref)
+      handleChange("imageUrl", url)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      // If user chose default outline, ensure value is the default image
+      const finalImageUrl = imageMode === "default" ? DEFAULT_OUTLINE_IMAGE : form.imageUrl
+
+      const updates: Record<string, any> = {
+        id: Number(form.id) || post.id,
+        title: form.title,
+        excerpt: form.excerpt,
+        imageUrl: finalImageUrl,
+        date: form.date,
+        readTime: form.readTime,
+        url: form.url,
+        status: form.status,
+      }
+
+      await update(ref(db, `analyticsDashaboard/${username}/requestedBlogs/${post.key}`), updates)
+      onUpdated({ ...form, id: updates.id, imageUrl: finalImageUrl })
+      setOpen(false)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <motion.div variants={item}>
       <Card className="relative h-full overflow-hidden transition-all duration-200 hover:shadow-lg hover:-translate-y-1">
@@ -802,12 +924,16 @@ function BlogCard({
           />
         </div>
 
-        <Link
-          href={`/blog-upload/${post.key}`}
-          className="absolute top-2 right-2 rounded-full p-1 text-muted-foreground hover:bg-muted hover:text-primary"
+        {/* Edit Button opens dialog (password protected) */}
+        <Button
+          size="icon"
+          variant="secondary"
+          className="absolute top-2 right-2 rounded-full p-1 text-muted-foreground hover:text-primary"
+          onClick={() => setOpen(true)}
+          aria-label="Edit blog"
         >
           <Pencil className="h-4 w-4" />
-        </Link>
+        </Button>
 
         <CardContent className="p-4">
           <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
@@ -834,9 +960,180 @@ function BlogCard({
           </div>
 
           <h3 className="mb-2 font-semibold break-words">{post.title}</h3>
-          <p className="text-sm text-muted-foreground">{post.excerpt}</p>
+          <p className="text-sm text-muted-foreground mb-2">{post.excerpt}</p>
+
+          {post.url && post.url !== "#" && (
+            <Button asChild variant="link" className="px-0">
+              <a href={post.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center">
+                Read more <ArrowRight className="ml-1 h-3 w-3" />
+              </a>
+            </Button>
+          )}
         </CardContent>
       </Card>
+
+      {/* Edit Dialog */}
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              {authed ? (
+                <>
+                  <Pencil className="h-4 w-4" /> Edit Blog
+                </>
+              ) : (
+                <>
+                  <Lock className="h-4 w-4" /> Enter password to edit
+                </>
+              )}
+            </DialogTitle>
+          </DialogHeader>
+
+          {!authed ? (
+            <div className="grid gap-4 py-2">
+              <div className="grid grid-cols-4 items-center gap-3">
+                <Label htmlFor="pass" className="text-right">Password</Label>
+                <div className="col-span-3 flex items-center gap-2">
+                  <Input
+                    id="pass"
+                    type="password"
+                    value={authPass}
+                    onChange={(e) => setAuthPass(e.target.value)}
+                    placeholder="Enter dev password"
+                  />
+                  <Button onClick={tryUnlock} disabled={!authPass} className="whitespace-nowrap">
+                    <KeyRound className="h-4 w-4 mr-1" /> Unlock
+                  </Button>
+                </div>
+              </div>
+              {authError && (
+                <Alert>
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription className="text-red-600">{authError}</AlertDescription>
+                </Alert>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="grid gap-4 py-2">
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label htmlFor="id" className="text-right">ID</Label>
+                  <Input
+                    id="id"
+                    type="number"
+                    value={form.id}
+                    onChange={(e) => handleChange("id", Number(e.target.value))}
+                    className="col-span-3"
+                  />
+                </div>
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label htmlFor="title" className="text-right">Title</Label>
+                  <Input id="title" value={form.title} onChange={(e) => handleChange("title", e.target.value)} className="col-span-3" />
+                </div>
+                <div className="grid grid-cols-4 items-start gap-3">
+                  <Label htmlFor="excerpt" className="text-right pt-2">Excerpt</Label>
+                  <Textarea id="excerpt" value={form.excerpt} onChange={(e) => handleChange("excerpt", e.target.value)} className="col-span-3" rows={3} />
+                </div>
+
+                {/* Image controls: choose upload or default outline */}
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label className="text-right">Image</Label>
+                  <div className="col-span-3 flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={imageMode === "upload" ? "default" : "outline"}
+                      onClick={() => setImageMode("upload")}
+                    >
+                      <ImagePlus className="h-4 w-4 mr-1" /> Upload
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={imageMode === "default" ? "default" : "outline"}
+                      onClick={() => {
+                        setImageMode("default")
+                        handleChange("imageUrl", DEFAULT_OUTLINE_IMAGE)
+                      }}
+                    >
+                      Use blog outline image
+                    </Button>
+                  </div>
+                </div>
+
+                {imageMode === "upload" && (
+                  <div className="grid grid-cols-4 items-center gap-3">
+                    <Label htmlFor="imageFile" className="text-right">Choose file</Label>
+                    <div className="col-span-3 flex items-center gap-2">
+                      <Input id="imageFile" type="file" accept="image/*" onChange={handleFile} />
+                      {uploading && (
+                        <span className="inline-flex items-center text-sm text-muted-foreground">
+                          <Loader2 className="h-4 w-4 animate-spin mr-1" /> Uploading…
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Manual URL still editable */}
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label htmlFor="imageUrl" className="text-right">Image URL</Label>
+                  <Input id="imageUrl" value={form.imageUrl} onChange={(e) => handleChange("imageUrl", e.target.value)} className="col-span-3" />
+                </div>
+
+                {/* Preview */}
+                <div className="grid grid-cols-4 items-start gap-3">
+                  <div className="col-start-2 col-span-3">
+                    <div className="rounded-md border p-2 bg-muted/30">
+                      <img src={form.imageUrl || DEFAULT_OUTLINE_IMAGE} alt="Preview" className="w-full h-40 object-contain" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label htmlFor="date" className="text-right">Date</Label>
+                  <Input id="date" type="date" value={form.date} onChange={(e) => handleChange("date", e.target.value)} className="col-span-3" />
+                </div>
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label htmlFor="readTime" className="text-right">Read time</Label>
+                  <Input id="readTime" value={form.readTime} onChange={(e) => handleChange("readTime", e.target.value)} className="col-span-3" />
+                </div>
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label htmlFor="url" className="text-right">URL</Label>
+                  <Input id="url" value={form.url} onChange={(e) => handleChange("url", e.target.value)} placeholder="# or https://..." className="col-span-3" />
+                </div>
+                <div className="grid grid-cols-4 items-center gap-3">
+                  <Label className="text-right">Status</Label>
+                  <div className="col-span-3">
+                    <Select value={form.status} onValueChange={(v: "pending" | "published") => handleChange("status", v)}>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="pending">Pending</SelectItem>
+                        <SelectItem value="published">Published</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </div>
+
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setOpen(false)} disabled={saving || uploading}>Cancel</Button>
+                <Button onClick={handleSave} className="bg-green-600 hover:bg-green-700 text-white" disabled={saving || uploading}>
+                  {saving ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" /> Saving
+                    </>
+                  ) : (
+                    "Save changes"
+                  )}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </motion.div>
   )
 }
