@@ -20,7 +20,7 @@ import {
   getFilteredRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { Loader2, TargetIcon, Plus, Sparkles, Globe, CheckCircle2, XCircle } from "lucide-react"
+import { Loader2, TargetIcon, Plus, Sparkles, Globe, CheckCircle2, XCircle, Trash2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useTargets } from "@/contexts/targets-context"
 
@@ -119,6 +119,7 @@ function sanitizeIcps(icps: IcpTable[]): IcpTable[] {
 function useColumns(
   addTarget: (kw: string) => void,
   toggleTarget: (row: KeywordRow, next: boolean) => void,
+  deleteRow: (row: KeywordRow) => void,
 ): ColumnDef<KeywordRow>[] {
   return useMemo<ColumnDef<KeywordRow>[]>(
     () => [
@@ -214,27 +215,39 @@ function useColumns(
         cell: ({ row }) => {
           const isTargeted = !!row.original.targeted
           return (
-            <Button
-              size="sm"
-              variant={isTargeted ? "default" : "outline"}
-              className={cn(
-                "flex items-center gap-1.5 rounded-full px-3",
-                isTargeted ? "bg-green-600 hover:bg-green-700 text-white" : "bg-transparent",
-              )}
-              onClick={() => {
-                const next = !isTargeted
-                toggleTarget(row.original, next)
-                if (next) addTarget(row.original.keyword)
-              }}
-            >
-              <TargetIcon className="h-4 w-4" />
-              {isTargeted ? "Targeted" : "Target"}
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant={isTargeted ? "default" : "outline"}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-full px-3",
+                  isTargeted ? "bg-green-600 hover:bg-green-700 text-white" : "bg-transparent",
+                )}
+                onClick={() => {
+                  const next = !isTargeted
+                  toggleTarget(row.original, next)
+                  if (next) addTarget(row.original.keyword)
+                }}
+              >
+                <TargetIcon className="h-4 w-4" />
+                {isTargeted ? "Targeted" : "Target"}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="rounded-full text-red-600"
+                onClick={() => deleteRow(row.original)}
+                aria-label="Delete row"
+                title="Delete"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </div>
           )
         },
       },
     ],
-    [addTarget, toggleTarget],
+    [addTarget, toggleTarget, deleteRow],
   )
 }
 
@@ -305,6 +318,17 @@ useEffect(() => {
         const nextIcps = prev.map((icp) => ({
           ...icp,
           rows: icp.rows.map((r) => (r === row ? { ...r, targeted: next } : r)),
+        }))
+        void persistIcps(nextIcps)
+        return nextIcps
+      })
+    },
+    // delete row persist
+    (rowToDelete) => {
+      setIcps((prev) => {
+        const nextIcps = prev.map((icp) => ({
+          ...icp,
+          rows: icp.rows.filter((r) => r !== rowToDelete),
         }))
         void persistIcps(nextIcps)
         return nextIcps
