@@ -326,10 +326,14 @@ useEffect(() => {
     // delete row persist
     (rowToDelete) => {
       setIcps((prev) => {
-        const nextIcps = prev.map((icp) => ({
-          ...icp,
-          rows: icp.rows.filter((r) => r !== rowToDelete),
-        }))
+        const nextIcps = prev
+          .map((icp) => ({
+            ...icp,
+            rows: icp.rows.filter((r) => r !== rowToDelete),
+          }))
+          // 🔽 remove ICPs that end up with zero rows
+          .filter((icp) => Array.isArray(icp.rows) && icp.rows.length > 0)
+
         void persistIcps(nextIcps)
         return nextIcps
       })
@@ -369,7 +373,7 @@ useEffect(() => {
         // If icps already exist -> render only (no re-analyze)
         if (data.icps && data.icps.length > 0) {
           if (!cancelled) {
-            setIcps(data.icps)
+            setIcps((data.icps || []).filter((icp) => Array.isArray(icp.rows) && icp.rows.length > 0))
             setPM(data.productMarkdown || "")
             setLoadingInit(false)
           }
