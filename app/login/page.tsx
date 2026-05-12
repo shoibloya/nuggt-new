@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { db } from "@/lib/firebase";
 import { ref, get } from "firebase/database";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "@/components/ui/card";
@@ -9,30 +9,35 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 
-export default function LoginPage() {
+function safeAppPath(path: string | null) {
+  if (!path || !path.startsWith("/") || path.startsWith("//")) return "/";
+  return path;
+}
+
+function LoginForm() {
   const [username, setU] = useState("");
   const [password, setP] = useState("");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const router = useRouter();
   const sp = useSearchParams();
-  const next = sp.get("next") || "/";
+  const next = safeAppPath(sp.get("next"));
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
     setLoading(true);
     try {
-      const snap = await get(ref(db, `auth/users/${username}/password`));
+      const userKey = username.trim();
+      const snap = await get(ref(db, `auth/users/${userKey}/password`));
       const stored = snap.val();
       if (!stored || stored !== password) {
         setErr("Invalid username/password");
         return;
       }
       // demo cookie (non-httpOnly) for middleware gate
-      document.cookie = `session=${encodeURIComponent(username)}; Path=/; Max-Age=${60 * 60 * 24 * 30}; SameSite=Lax`;
-      router.push(next);
+      document.cookie = `session=${encodeURIComponent(userKey)}; Path=/; Max-Age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+      window.location.assign(next);
     } catch (e) {
       setErr("Login failed. Please try again.");
     } finally {
@@ -68,5 +73,26 @@ export default function LoginPage() {
         </CardFooter>
       </Card>
     </div>
+  );
+}
+
+function LoginFallback() {
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle>Sign in</CardTitle>
+          <CardDescription>Loading sign in...</CardDescription>
+        </CardHeader>
+      </Card>
+    </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<LoginFallback />}>
+      <LoginForm />
+    </Suspense>
   );
 }

@@ -11,13 +11,16 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Badge } from "@/components/ui/badge"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   LineChart as RLineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer,
 } from "recharts"
 import {
   Users, TrendingUp, Plus, RefreshCw, Calendar as CalendarIcon,
   LineChart as LineChartIcon, Target as TargetIcon, CheckCircle2, XCircle, X,
+  MapPin,
 } from "lucide-react"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Calendar } from "@/components/ui/calendar"
@@ -28,6 +31,7 @@ import { useTargets } from "@/contexts/targets-context"
 // Firebase
 import { db } from "@/lib/firebase"
 import { ref, onValue, update, get } from "firebase/database"
+import { COUNTRY_OPTIONS, DEFAULT_COUNTRY, countryLabel, normalizeCountryCodes } from "@/lib/countries"
 
 /* ---------- types & helpers ---------- */
 type Channel = "chatgpt" | "perplexity" | "gaio" | "google"
@@ -41,16 +45,30 @@ type SerpResult = {
   perplexity: SerpHit
   google: SerpHit
 }
+type SerpEntry = SerpResult & { query?: string; error?: string | null }
+type SerpMap = Record<string, SerpEntry>
 type PlanGroup = { must: string; longTails: string[] }
+type ProcessingStatus = {
+  stage: "scraping" | "planning" | "ranking" | "gsc" | "complete" | "error"
+  completed: number
+  total: number
+  message: string
+  updatedAt: number
+  error?: string | null
+}
 type SavedBlog = {
   url: string
   addedAt?: number
   publishedAt?: number
   scrapedAt?: number
   processing?: boolean | null
+  processingStartedAt?: number | null
+  processingStatus?: ProcessingStatus | null
+  countries?: string[]
   scrape?: { markdown?: string }
   plan?: { mustPhrases: string[]; groups: PlanGroup[]; flatQueries: string[] }
-  serp?: Record<string, SerpResult>
+  serp?: SerpMap
+  countrySerp?: Record<string, SerpMap>
   targets?: Record<string, boolean>
   aggregates?: {
     chatgptCitations: number
@@ -70,6 +88,8 @@ type SavedBlog = {
 
 const COLORS = { clicks: "#7c3aed", impressions: "#10b981", grid: "#e2e8f0", citations: "#0ea5e9", mentions: "#f97316" }
 const safeKey = (s: string) => s.replace(/[.#$/\[\]]/g, "_")
+const promptKey = (s: string) => safeKey(s.trim().toLowerCase())
+const targetKey = (country: string, keyword: string) => `${country}_${promptKey(keyword)}`
 const formatDateLabel = (yyyymmdd: string) => `${yyyymmdd.slice(4, 6)}/${yyyymmdd.slice(6, 8)}`
 const normaliseSiteUrl = (id: string) => (id.startsWith("sc-domain:") ? id : id.endsWith("/") ? id : id + "/")
 const urlHostname = (u: string) => { try { return new URL(u).hostname.toLowerCase() } catch { return "" } }
@@ -87,6 +107,61 @@ const clampBrandMentions = (citations: number, proposed: number) =>
 
 // 7-day TTL
 const TTL_MS = 7 * 24 * 60 * 60 * 1000
+const PROCESSING_STALE_MS = 2 * 60 * 1000
+const RANK_WORKERS = 5
+
+function getSerpResult(map: SerpMap | undefined, query: string) {
+  return map?.[promptKey(query)] || map?.[query]
+}
+
+function setSerpResult(map: SerpMap, query: string, result: SerpResult, error?: string | null) {
+  map[promptKey(query)] = { ...result, query, error: error || null }
+}
+
+function getCountrySerp(blog: SavedBlog, country: string): SerpMap {
+  return blog.countrySerp?.[country] || (country === DEFAULT_COUNTRY ? blog.serp || {} : {})
+}
+
+function countRanked(map: SerpMap, channel: keyof SerpResult) {
+  return Object.values(map).filter((x) => x?.[channel]?.ranked).length
+}
+
+function countFinishedChecks(blog: SavedBlog, countries = normalizeCountryCodes(blog.countries)) {
+  const queries = blog.plan?.flatQueries || []
+  return countries.reduce((total, country) => {
+    const map = getCountrySerp(blog, country)
+    return total + queries.filter((query) => !!getSerpResult(map, query)).length
+  }, 0)
+}
+
+function totalChecks(blog: SavedBlog, countries = normalizeCountryCodes(blog.countries)) {
+  return (blog.plan?.flatQueries?.length || 0) * countries.length
+}
+
+function hasCompleteRankChecks(blog: SavedBlog) {
+  const total = totalChecks(blog)
+  return !!blog.plan && (total === 0 || countFinishedChecks(blog) >= total)
+}
+
+async function postJsonWithRetry<T>(url: string, body: unknown, label: string, attempts = 3): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      const json = await response.json()
+      if (!response.ok || json?.success === false) throw new Error(json?.error || `${label} failed`)
+      return json as T
+    } catch (error) {
+      lastError = error
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`${label} failed`)
+}
 
 /* ---------- helpers for cumulative series ---------- */
 type CumPoint = { date: number; label: string; a: number; b?: number }
@@ -222,6 +297,7 @@ export default function PerformanceSection() {
   // Blogs list + overall aggregates
   const [inputUrl, setInputUrl] = useState("")
   const [publishedDate, setPublishedDate] = useState<Date | null>(null)
+  const [selectedCountries, setSelectedCountries] = useState<string[]>([DEFAULT_COUNTRY])
   const [saving, setSaving] = useState(false)
   const [blogs, setBlogs] = useState<SavedBlog[]>([])
   const [loadingBlogs, setLoadingBlogs] = useState(true)
@@ -313,6 +389,7 @@ export default function PerformanceSection() {
   async function addBlogUrl() {
     if (!inputUrl.trim() || !username || !token) return
     if (!publishedDate) { alert("Please pick the blog's published date."); return }
+    const countries = normalizeCountryCodes(selectedCountries)
     let url = inputUrl.trim()
     try {
       const u = new URL(url)
@@ -324,11 +401,24 @@ export default function PerformanceSection() {
     }
     setSaving(true)
     try {
+      const base = `analyticsDashaboard/${username}/performanceBlogs/${safeKey(url)}`
+      const existingSnap = await get(ref(db, base))
+      const existing = (existingSnap.val() as SavedBlog | null) || null
+      const mergedCountries = normalizeCountryCodes([...(existing?.countries || []), ...countries])
       await update(ref(db, `analyticsDashaboard/${username}`), {
         [`performanceBlogs/${safeKey(url)}`]: {
+          ...(existing || {}),
           url,
-          addedAt: Date.now(),
+          addedAt: existing?.addedAt || Date.now(),
           publishedAt: publishedDate.getTime(),
+          countries: mergedCountries,
+          processingStatus: existing?.processingStatus || {
+            stage: "scraping",
+            completed: 0,
+            total: 0,
+            message: "Queued for analysis",
+            updatedAt: Date.now(),
+          },
         },
       })
       setInputUrl("")
@@ -520,7 +610,7 @@ export default function PerformanceSection() {
                 </div>
                 <div>
                   <h3 className="font-semibold text-gray-900">Add Blog URL</h3>
-                  <p className="text-sm text-gray-600">Add a blog post URL and the date it was published</p>
+                  <p className="text-sm text-gray-600">Add a URL once, then track the same prompts across selected countries</p>
                 </div>
               </div>
               <div className="flex flex-col md:flex-row gap-3">
@@ -532,16 +622,17 @@ export default function PerformanceSection() {
                   className="flex-1"
                 />
                 <DatePicker label="Published" date={publishedDate || new Date()} setDate={(d) => setPublishedDate(d)} />
+                <CountryPicker selected={selectedCountries} onChange={setSelectedCountries} />
                 <Button
                   onClick={addBlogUrl}
-                  disabled={!inputUrl || saving || !username || !publishedDate}
+                  disabled={!inputUrl || saving || !username || !publishedDate || selectedCountries.length === 0}
                   className="shrink-0 bg-green-600 hover:bg-green-700"
                 >
                   {saving ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4 mr-1" />}
                   {saving ? "Saving…" : "Add Blog URL"}
                 </Button>
               </div>
-              <p className="text-xs text-gray-500">We’ll analyze new URLs automatically after sign-in. Overview cards & graphs update when done.</p>
+              <p className="text-xs text-gray-500">Adding an existing URL merges the new countries into the same prompt set, so users do not have to duplicate work.</p>
             </div>
           </Card>
 
@@ -623,38 +714,67 @@ function BlogRow({
     for (const s of sites) if (pageStartsWithSite(blog.url, s.siteUrl)) return s.siteUrl
     return null
   }, [sites, blog.url])
+  const countries = useMemo(() => normalizeCountryCodes(blog.countries), [blog.countries])
+  const countriesKey = countries.join(",")
 
-  const ranRef = useRef(false)
+  const inFlightRef = useRef(false)
   useEffect(() => {
     if (!username || !token) return
-    if (ranRef.current) return
-    ranRef.current = true
+    if (inFlightRef.current) return
 
     let cancelled = false
     ;(async () => {
       const base = `analyticsDashaboard/${username}/performanceBlogs/${safeKey(blog.url)}`
       try {
         const snap = await get(ref(db, base))
-        const remote = (snap.val() as SavedBlog) || {}
+        const remote = ({ ...blog, ...((snap.val() as SavedBlog) || {}) }) as SavedBlog
+        const activeCountries = normalizeCountryCodes(remote.countries || countries)
         setLocal(remote.url ? remote : blog)
 
-        const freshEnough = remote.aggregates?.updatedAt && Date.now() - remote.aggregates.updatedAt < TTL_MS
-        const hasAll = !!remote.plan && !!remote.serp
-        if ((hasAll && freshEnough) || remote.processing) {
+        const now = Date.now()
+        const statusUpdatedAt = remote.processingStatus?.updatedAt || remote.processingStartedAt || 0
+        const processingIsFresh = !!remote.processing && now - statusUpdatedAt < PROCESSING_STALE_MS
+        const recentError = remote.processingStatus?.stage === "error" && now - statusUpdatedAt < 30_000
+        const freshEnough = remote.aggregates?.updatedAt && now - remote.aggregates.updatedAt < TTL_MS
+        if (recentError || processingIsFresh) return
+        if (hasCompleteRankChecks(remote) && freshEnough) {
           await ensureGscAggregates(remote)
           return
         }
 
-        await update(ref(db), { [`${base}/processing`]: true })
+        inFlightRef.current = true
+        const startedAt = Date.now()
+        const updateStatus = async (
+          stage: ProcessingStatus["stage"],
+          message: string,
+          completed = 0,
+          total = totalChecks(remote, activeCountries),
+          error: string | null = null,
+        ) => {
+          if (cancelled) return
+          await update(ref(db), {
+            [`${base}/processing`]: stage !== "complete" && stage !== "error" ? true : null,
+            [`${base}/processingStartedAt`]: stage !== "complete" && stage !== "error" ? startedAt : null,
+            [`${base}/processingStatus`]: {
+              stage,
+              completed,
+              total,
+              message,
+              updatedAt: Date.now(),
+              error,
+            },
+          })
+        }
 
         // 1) scrape
+        await updateStatus("scraping", "Scraping the blog page")
         let markdown = remote.scrape?.markdown || ""
         if (!markdown) {
-          const scrapeResp = await fetch("/api/scrape", {
-            method: "POST",
-            body: JSON.stringify({ url: blog.url, onlyMarkdown: true }),
-          }).then((r) => r.json())
-          if (!scrapeResp.success) throw new Error(scrapeResp.error || "Scrape failed")
+          const scrapeResp = await postJsonWithRetry<{ success: boolean; data: { markdown?: string } }>(
+            "/api/scrape",
+            { url: blog.url, onlyMarkdown: true },
+            "Scrape",
+          )
           markdown = scrapeResp.data.markdown || ""
           await update(ref(db), {
             [`${base}/scrape`]: { markdown },
@@ -663,77 +783,113 @@ function BlogRow({
         }
 
         // 2) plan
+        await updateStatus("planning", "Generating prompts from the page")
         let planFull = remote.plan
         if (!planFull) {
-          const planResp = await fetch("/api/blog-plan", {
-            method: "POST",
-            body: JSON.stringify({ markdown }),
-          }).then((r) => r.json())
-          if (!planResp.success) throw new Error(planResp.error || "Plan generation failed")
+          const planResp = await postJsonWithRetry<{
+            success: boolean
+            data: { mustPhrases: string[]; groups: PlanGroup[] }
+          }>("/api/blog-plan", { markdown }, "Prompt generation")
           const p = planResp.data as { mustPhrases: string[]; groups: PlanGroup[] }
           const flat = Array.from(new Set(p.groups.flatMap((g) => g.longTails)))
           planFull = { ...p, flatQueries: flat }
           await update(ref(db), { [`${base}/plan`]: planFull })
         }
 
-        // 3) rank missing queries
-        const serpMap: SavedBlog["serp"] = { ...(remote.serp || {}) }
-        const toRank = (planFull?.flatQueries ?? []).filter((kw) => !serpMap[kw])
-        if (toRank.length) {
+        // 3) rank every missing prompt/country pair
+        const countrySerp: Record<string, SerpMap> = { ...(remote.countrySerp || {}) }
+        if (remote.serp && !countrySerp[DEFAULT_COUNTRY]) countrySerp[DEFAULT_COUNTRY] = remote.serp
+        activeCountries.forEach((country) => {
+          countrySerp[country] = { ...(countrySerp[country] || {}) }
+        })
+
+        const queriesToTrack = planFull?.flatQueries ?? []
+        if (queriesToTrack.length === 0) {
+          await update(ref(db), {
+            [`${base}/countries`]: activeCountries,
+            [`${base}/aggregates`]: { ...(remote.aggregates || {}), updatedAt: Date.now() },
+          })
+          await updateStatus("complete", "No prompts were generated for this page", 0, 0)
+          return
+        }
+
+        const missingChecks = activeCountries.flatMap((country) =>
+          queriesToTrack
+            .filter((query) => !getSerpResult(countrySerp[country], query))
+            .map((query) => ({ country, query })),
+        )
+
+        const total = queriesToTrack.length * activeCountries.length
+        let completed = activeCountries.reduce(
+          (sum, country) => sum + queriesToTrack.filter((query) => !!getSerpResult(countrySerp[country], query)).length,
+          0,
+        )
+
+        if (missingChecks.length) {
           const hostname = urlHostname(blog.url)
           const domain = hostname.replace(/^www\./, "")
-          const queue = [...toRank]
-          const BATCH_FLUSH = 15
-          const workers = 5
+          const queue = [...missingChecks]
 
-          async function rankOne(kw: string) {
+          await updateStatus("ranking", "Checking prompts across selected countries", completed, total)
+
+          async function rankOne(task: { country: string; query: string }) {
             try {
-              const r = await fetch("/api/rank", {
-                method: "POST",
-                body: JSON.stringify({ query: kw, domain }),
-              }).then((res) => res.json())
-              if (!r.success) throw new Error(r.error || "rank error")
-              serpMap[kw] = {
+              const r = await postJsonWithRetry<{
+                success: boolean
+                data: { google: SerpHit; bing: SerpHit }
+              }>("/api/rank", { query: task.query, domain, country: task.country }, "Rank check")
+              setSerpResult(countrySerp[task.country], task.query, {
                 chatgpt:   { ranked: !!r.data?.bing?.ranked,   url: r.data?.bing?.url   || null },
                 perplexity:{ ranked: !!r.data?.google?.ranked, url: r.data?.google?.url || null },
                 google:    { ranked: !!r.data?.google?.ranked, url: r.data?.google?.url || null },
-              }
-            } catch {
-              serpMap[kw] = {
+              })
+            } catch (error) {
+              setSerpResult(countrySerp[task.country], task.query, {
                 chatgpt: { ranked: false, url: null },
                 perplexity: { ranked: false, url: null },
                 google: { ranked: false, url: null },
-              }
+              }, error instanceof Error ? error.message : "Rank check failed")
             }
+
+            completed += 1
+            await update(ref(db), {
+              [`${base}/countrySerp/${task.country}`]: countrySerp[task.country],
+              [`${base}/processingStatus`]: {
+                stage: "ranking",
+                completed,
+                total,
+                message: `Checked ${completed} of ${total} prompt/country pairs`,
+                updatedAt: Date.now(),
+                error: null,
+              },
+            })
           }
 
-          let sinceFlush = 0
           async function worker() {
             while (queue.length && !cancelled) {
-              const kw = queue.shift()!
-              await rankOne(kw)
-              sinceFlush++
-              if (sinceFlush >= BATCH_FLUSH) {
-                sinceFlush = 0
-                await update(ref(db), { [`${base}/serp`]: serpMap })
-              }
+              const task = queue.shift()!
+              await rankOne(task)
             }
           }
-          await Promise.all(Array.from({ length: workers }, worker))
+          await Promise.all(Array.from({ length: Math.min(RANK_WORKERS, queue.length || 1) }, worker))
+        } else {
+          await updateStatus("ranking", "All prompt/country checks are already complete", completed, total)
         }
 
-        const allSerp = (serpMap || remote.serp || {}) as Record<string, SerpResult>
-        const chatgptCites = Object.values(allSerp).filter((x) => x.chatgpt.ranked).length
-        const perplexCites = Object.values(allSerp).filter((x) => x.perplexity.ranked).length
-        const googleP1 = Object.values(allSerp).filter((x) => x.google.ranked).length
-        const totalQs = planFull?.flatQueries.length || 0
+        const countryMaps = activeCountries.map((country) => countrySerp[country] || {})
+        const chatgptCites = countryMaps.reduce((sum, map) => sum + countRanked(map, "chatgpt"), 0)
+        const perplexCites = countryMaps.reduce((sum, map) => sum + countRanked(map, "perplexity"), 0)
+        const googleP1 = countryMaps.reduce((sum, map) => sum + countRanked(map, "google"), 0)
+        const totalQs = total
 
         const brandMentionsCGPT = clampBrandMentions(chatgptCites, Math.round(totalQs * (Math.random() * 0.2 + 0.1)))
         const brandMentionsPerp = clampBrandMentions(perplexCites, Math.round(totalQs * (Math.random() * 0.2 + 0.1)))
 
         await update(ref(db), {
           [`${base}/plan`]: planFull,
-          [`${base}/serp`]: allSerp,
+          [`${base}/countries`]: activeCountries,
+          [`${base}/countrySerp`]: countrySerp,
+          [`${base}/serp`]: countrySerp[activeCountries[0]] || countrySerp[DEFAULT_COUNTRY] || {},
           [`${base}/aggregates`]: {
             ...(remote.aggregates || {}),
             chatgptCitations: chatgptCites,
@@ -746,11 +902,25 @@ function BlogRow({
         })
 
         // 4) ensure GSC aggregates
+        await updateStatus("gsc", "Refreshing Google Search Console metrics", completed, total)
         await ensureGscAggregates({ ...remote, url: blog.url })
-        await update(ref(db), { [`${base}/processing`]: null })
+        await updateStatus("complete", "Analysis complete", total, total)
       } catch (e) {
         console.error(e)
-        await update(ref(db), { [`${base}/processing`]: null })
+        await update(ref(db), {
+          [`${base}/processing`]: null,
+          [`${base}/processingStartedAt`]: null,
+          [`${base}/processingStatus`]: {
+            stage: "error",
+            completed: countFinishedChecks(blog),
+            total: totalChecks(blog),
+            message: "Analysis paused after repeated failures",
+            updatedAt: Date.now(),
+            error: e instanceof Error ? e.message : "Unknown error",
+          },
+        })
+      } finally {
+        inFlightRef.current = false
       }
     })()
 
@@ -819,11 +989,22 @@ function BlogRow({
       }
     }
 
-    return () => { /* cancelled via closure */ }
-  }, [blog.url, username, token, sites, matchingSite])
+    return () => { cancelled = true }
+  }, [blog, blog.url, countriesKey, username, token, sites, matchingSite])
 
-  const analyzing = !!local.processing || !local.plan || !local.serp
+  const rankTotal = totalChecks(local, countries)
+  const rankDone = countFinishedChecks(local, countries)
+  const analyzing = !!local.processing || !local.plan || (rankTotal > 0 && rankDone < rankTotal)
   const hasData = local.aggregates
+  const status = local.processingStatus
+  const progressLabel =
+    analyzing && status?.stage === "ranking" && status.total
+      ? `${status.completed}/${status.total} checks`
+      : analyzing
+        ? status?.message || "Preparing analysis"
+        : status?.stage === "error"
+          ? "Needs retry"
+          : "Ready"
 
   // channel-specific micro summary
   let micro = ""
@@ -840,13 +1021,28 @@ function BlogRow({
     <div className="flex items-center justify-between rounded-lg border border-gray-200 p-4 hover:bg-gray-50/50 transition-colors">
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium truncate text-gray-900">{blog.url}</div>
-        <div className="flex items-center gap-4 mt-2">
+        <div className="flex flex-wrap items-center gap-2 mt-2">
           <div className="text-xs text-gray-500">Published: {publishedLabel}</div>
+          <div className="flex flex-wrap gap-1">
+            {countries.map((country) => (
+              <Badge key={country} variant="outline" className="h-5 rounded-full px-2 text-[11px]">
+                {countryLabel(country)}
+              </Badge>
+            ))}
+          </div>
           <div className="text-xs text-gray-500">
-            {analyzing ? "Analyzing… generating keywords and checking SERPs" : "Ready"}
+            {progressLabel}
           </div>
           {hasData && !analyzing && <div className="text-xs text-gray-600">{micro}</div>}
         </div>
+        {analyzing && rankTotal > 0 && (
+          <div className="mt-3 h-2 w-full max-w-md overflow-hidden rounded-full bg-gray-100">
+            <div
+              className="h-full rounded-full bg-slate-700 transition-all"
+              style={{ width: `${Math.max(8, Math.round((rankDone / rankTotal) * 100))}%` }}
+            />
+          </div>
+        )}
       </div>
       <div>
         {analyzing ? (
@@ -876,12 +1072,17 @@ function ReportCard({
   onClose: () => void
 }) {
   // Local copies
+  const countries = useMemo(() => normalizeCountryCodes(blog.countries), [blog.countries])
+  const [selectedCountry, setSelectedCountry] = useState(countries[0] || DEFAULT_COUNTRY)
   const [plan, setPlan] = useState(blog.plan!)
-  const [serp, setSerp] = useState(blog.serp!)
+  const [serp, setSerp] = useState<SerpMap>(getCountrySerp(blog, selectedCountry))
   const [targets, setTargets] = useState<Record<string, boolean>>(blog.targets || {})
 
   useEffect(() => { if (blog.plan) setPlan(blog.plan) }, [blog.plan])
-  useEffect(() => { if (blog.serp) setSerp(blog.serp) }, [blog.serp])
+  useEffect(() => {
+    if (!countries.includes(selectedCountry)) setSelectedCountry(countries[0] || DEFAULT_COUNTRY)
+  }, [countries, selectedCountry])
+  useEffect(() => { setSerp(getCountrySerp(blog, selectedCountry)) }, [blog, selectedCountry])
   useEffect(() => { setTargets(blog.targets || {}) }, [blog.targets])
 
   // GSC state (only used for GAIO/Google)
@@ -953,10 +1154,10 @@ await fetch(api, {
 
   // Derived
   const flatQueries = plan?.flatQueries ?? []
-  const rankedChatGPT = flatQueries.filter((q) => serp?.[q]?.chatgpt.ranked)
-  const notChatGPT = flatQueries.filter((q) => !serp?.[q]?.chatgpt.ranked)
-  const rankedPerp = flatQueries.filter((q) => serp?.[q]?.perplexity.ranked)
-  const notPerp = flatQueries.filter((q) => !serp?.[q]?.perplexity.ranked)
+  const rankedChatGPT = flatQueries.filter((q) => getSerpResult(serp, q)?.chatgpt.ranked)
+  const notChatGPT = flatQueries.filter((q) => !getSerpResult(serp, q)?.chatgpt.ranked)
+  const rankedPerp = flatQueries.filter((q) => getSerpResult(serp, q)?.perplexity.ranked)
+  const notPerp = flatQueries.filter((q) => !getSerpResult(serp, q)?.perplexity.ranked)
   const gaioQueries = queries.filter((q) => q.query.length > 50)
   const totalClicks = daily.reduce((t, d) => t + d.clicks, 0)
   const totalImpressions = daily.reduce((t, d) => t + d.impressions, 0)
@@ -966,14 +1167,28 @@ await fetch(api, {
 
   return (
     <Card className="p-4 border-2 relative max-h-[85vh] overflow-auto bg-white">
-      <div className="flex items-start justify-between gap-4 sticky top-0 bg-white/90 backdrop-blur z-10 -m-4 p-4 border-b">
+      <div className="flex flex-col gap-3 sticky top-0 bg-white/90 backdrop-blur z-10 -m-4 p-4 border-b sm:flex-row sm:items-start sm:justify-between">
         <div>
           <CardTitle className="text-xl text-gray-900">Report</CardTitle>
           <CardDescription className="break-all text-gray-600">{blog.url}</CardDescription>
         </div>
-        <Button variant="ghost" size="icon" onClick={onClose} className="h-8 w-8">
-          <X className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-2">
+          <Select value={selectedCountry} onValueChange={setSelectedCountry}>
+            <SelectTrigger className="h-9 w-[180px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {countries.map((country) => (
+                <SelectItem key={country} value={country}>
+                  {countryLabel(country)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button variant="ghost" size="icon" onClick={onClose} className="h-8 w-8">
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
 
       <div className="mt-4 space-y-4">
@@ -994,8 +1209,9 @@ await fetch(api, {
               notRanked={notChatGPT}
               username={username}
               blogUrl={blog.url}
+              country={selectedCountry}
               targets={targets}
-              onToggled={(kw, next) => setTargets((prev) => ({ ...prev, [safeKey(kw)]: next }))}
+              onToggled={(kw, next) => setTargets((prev) => ({ ...prev, [targetKey(selectedCountry, kw)]: next }))}
             />
           </>
         )}
@@ -1016,8 +1232,9 @@ await fetch(api, {
               notRanked={notPerp}
               username={username}
               blogUrl={blog.url}
+              country={selectedCountry}
               targets={targets}
-              onToggled={(kw, next) => setTargets((prev) => ({ ...prev, [safeKey(kw)]: next }))}
+              onToggled={(kw, next) => setTargets((prev) => ({ ...prev, [targetKey(selectedCountry, kw)]: next }))}
             />
           </>
         )}
@@ -1123,7 +1340,7 @@ await fetch(api, {
             {/* cards first */}
             <Card className="p-4 border-gray-200">
               <div className="grid gap-4 sm:grid-cols-3">
-                <SmallMetric label="First-page queries" value={serp ? Object.values(serp).filter((x) => x.google.ranked).length : 0} />
+                <SmallMetric label="First-page queries" value={countRanked(serp, "google")} />
                 <SmallMetric label="Traffic (total clicks)" value={totalClicks.toLocaleString()} />
                 <SmallMetric label="Impressions (total)" value={totalImpressions.toLocaleString()} />
               </div>
@@ -1378,12 +1595,13 @@ function ChannelHeader({
 }
 
 function QueryBuckets({
-  ranked, notRanked, username, blogUrl, targets, onToggled,
+  ranked, notRanked, username, blogUrl, country, targets, onToggled,
 }: {
   ranked: string[]
   notRanked: string[]
   username: string
   blogUrl: string
+  country: string
   targets: Record<string, boolean>
   onToggled: (kw: string, next: boolean) => void
 }) {
@@ -1418,8 +1636,8 @@ function QueryBuckets({
         {notRanked.length ? (
           <ul className="space-y-2 max-h-64 overflow-auto pr-1">
             {notRanked.map((q) => {
-              const key = safeKey(q)
-              const initial = !!targets?.[key]
+              const key = targetKey(country, q)
+              const initial = !!targets?.[key] || !!targets?.[safeKey(q)]
               return (
                 <li key={q} className="flex items-center gap-2 text-sm">
                   <span className="inline-flex items-center justify-center rounded-full bg-rose-100 text-rose-700 w-5 h-5">✗</span>
@@ -1428,6 +1646,7 @@ function QueryBuckets({
                     keyword={q}
                     username={username}
                     blogUrl={blogUrl}
+                    country={country}
                     initialTargeted={initial}
                     onToggled={onToggled}
                   />
@@ -1444,28 +1663,31 @@ function QueryBuckets({
 }
 
 function TargetButton({
-  keyword, username, blogUrl, initialTargeted, onToggled,
+  keyword, username, blogUrl, country, initialTargeted, onToggled,
 }: {
   keyword: string
   username: string
   blogUrl: string
+  country: string
   initialTargeted: boolean
   onToggled: (kw: string, next: boolean) => void
 }) {
   const { addTarget } = (typeof useTargets === "function" ? useTargets() : { addTarget: undefined as any })
   const [targeted, setTargeted] = useState<boolean>(!!initialTargeted)
+  useEffect(() => setTargeted(!!initialTargeted), [initialTargeted])
 
   const toggle = async () => {
     const next = !targeted
     setTargeted(next)
 
     // Persist under blog's targets
-    const base = `analyticsDashaboard/${username}/performanceBlogs/${safeKey(blogUrl)}/targets/${safeKey(keyword)}`
+    const scopedKey = targetKey(country, keyword)
+    const base = `analyticsDashaboard/${username}/performanceBlogs/${safeKey(blogUrl)}/targets/${scopedKey}`
     await update(ref(db), { [base]: next ? true : null })
 
     // Mirror into global Targets section
-    const mirror = `analyticsDashaboard/${username}/targetsFromReport/${safeKey(keyword)}`
-    await update(ref(db), { [mirror]: next ? { keyword, targeted: true } : null })
+    const mirror = `analyticsDashaboard/${username}/targetsFromReport/${scopedKey}`
+    await update(ref(db), { [mirror]: next ? { keyword: `${keyword} (${countryLabel(country)})`, prompt: keyword, country, targeted: true } : null })
 
     if (next && addTarget) addTarget(keyword)
     onToggled(keyword, next)
@@ -1499,6 +1721,67 @@ function ConnectGSCNote() {
 }
 function MismatchNote() {
   return <div className="text-sm text-amber-700">URL does not match any of your GSC properties.</div>
+}
+function CountryPicker({ selected, onChange }: { selected: string[]; onChange: (next: string[]) => void }) {
+  const normalized = normalizeCountryCodes(selected)
+  const toggleCountry = (code: string) => {
+    const next = normalized.includes(code)
+      ? normalized.filter((country) => country !== code)
+      : [...normalized, code]
+    onChange(next.length ? next : [DEFAULT_COUNTRY])
+  }
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="outline" className="min-h-9 w-full justify-start gap-2 md:w-[240px]">
+          <MapPin className="h-4 w-4 text-slate-500" />
+          <span className="truncate">
+            {normalized.length === 1
+              ? countryLabel(normalized[0])
+              : `${normalized.length} countries`}
+          </span>
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-[280px] p-3">
+        <div className="mb-3">
+          <div className="text-sm font-medium text-gray-900">Track countries</div>
+          <div className="text-xs text-gray-500">The same prompts will be checked in each selected market.</div>
+        </div>
+        <div className="grid gap-1">
+          {COUNTRY_OPTIONS.map((country) => {
+            const checked = normalized.includes(country.code)
+            return (
+              <div
+                key={country.code}
+                role="button"
+                tabIndex={0}
+                onClick={() => toggleCountry(country.code)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    toggleCountry(country.code)
+                  }
+                }}
+                className="flex w-full items-center gap-3 rounded-md px-2 py-2 text-left text-sm hover:bg-gray-50"
+              >
+                <Checkbox checked={checked} aria-label={`Select ${country.label}`} />
+                <span className="flex-1 text-gray-800">{country.label}</span>
+                <span className="text-xs text-gray-400">{country.code}</span>
+              </div>
+            )
+          })}
+        </div>
+        <div className="mt-3 flex flex-wrap gap-1">
+          {normalized.map((country) => (
+            <Badge key={country} variant="secondary" className="rounded-full">
+              {countryLabel(country)}
+            </Badge>
+          ))}
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
 }
 function DatePicker({ label, date, setDate }: { label: string; date: Date; setDate: (d: Date) => void }) {
   return (

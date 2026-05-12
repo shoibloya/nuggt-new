@@ -2,12 +2,11 @@
    Generates a blog outline for a keyword using GPT‑4.1.        */
 
 import { NextRequest, NextResponse } from "next/server"
-import OpenAI from "openai"
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! })
+import { getOpenAIClient } from "@/lib/openai"
 
 export async function POST(req: NextRequest) {
   try {
+    const openai = getOpenAIClient()
     const { keyword, companyMarkdown = "" } = (await req.json()) as {
       keyword: string
       companyMarkdown?: string

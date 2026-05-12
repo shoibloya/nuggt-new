@@ -1,6 +1,13 @@
 import OpenAI from "openai"
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! })
+let openai: OpenAI | null = null
+
+export function getOpenAIClient() {
+  const apiKey = process.env.OPENAI_API_KEY
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not configured")
+  openai ??= new OpenAI({ apiKey })
+  return openai
+}
 
 /* ───────────────────────── Analyse whole site ─────────────────── */
 export async function analyseContent(payload: {
@@ -8,6 +15,7 @@ export async function analyseContent(payload: {
   blogTitles: string[]
 }) {
   const { productPagesMarkdown, blogTitles } = payload
+  const openai = getOpenAIClient()
 
   const systemPrompt = `
 You are a senior SaaS marketing analyst.
@@ -53,6 +61,7 @@ export async function generateQueries(
   companyMarkdown: string,
   icpName: string,
 ) {
+  const openai = getOpenAIClient()
   const sys = `You are an SEO strategist. Return ONLY JSON: {"queries":[ "...", ... ]}`
   const usr = `
 Company info:
@@ -79,6 +88,7 @@ export async function generateReport(opts: {
   ranked: string[]
   notRanked: string[]
 }) {
+  const openai = getOpenAIClient()
   const sys = `
 You help companies rank via blogs/whitepapers.  
 Return ONLY JSON:
@@ -126,6 +136,7 @@ Returns ONLY JSON:
 }
 */
 export async function generateBlogKeywordPlanFromMarkdown(markdown: string) {
+  const openai = getOpenAIClient()
   const system = `
 You are an elite SEO strategist.
 

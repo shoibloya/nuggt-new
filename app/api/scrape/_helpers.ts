@@ -1,8 +1,17 @@
 // app/api/scrape/_helpers.ts
 import FirecrawlApp from "@mendable/firecrawl-js";
-const app = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY! });
+
+let firecrawlApp: FirecrawlApp | null = null;
+
+function getFirecrawlApp() {
+  const apiKey = process.env.FIRECRAWL_API_KEY;
+  if (!apiKey) throw new Error("FIRECRAWL_API_KEY is not configured");
+  firecrawlApp ??= new FirecrawlApp({ apiKey });
+  return firecrawlApp;
+}
 
 export async function scrapePage(targetUrl: string): Promise<string> {
+  const app = getFirecrawlApp();
   const res = await app.scrapeUrl(targetUrl, { formats: ["markdown"], timeout: 60_000 });
   if (!res.success) throw new Error(res.error ?? "Firecrawl scrape failed");
   return res.markdown ?? "";

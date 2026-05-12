@@ -1,9 +1,17 @@
 import FirecrawlApp from "@mendable/firecrawl-js"
 
-const app = new FirecrawlApp({ apiKey: process.env.FIRECRAWL_API_KEY! })
+let firecrawlApp: FirecrawlApp | null = null
+
+function getFirecrawlApp() {
+  const apiKey = process.env.FIRECRAWL_API_KEY
+  if (!apiKey) throw new Error("FIRECRAWL_API_KEY is not configured")
+  firecrawlApp ??= new FirecrawlApp({ apiKey })
+  return firecrawlApp
+}
 
 /** Crawl up to 100 pages and classify product vs blog */
 export async function crawlSite(url: string) {
+  const app = getFirecrawlApp()
   const res = await app.crawlUrl(url, {
     limit: 100,
     scrapeOptions: { formats: ["markdown", "html"] },
@@ -14,15 +22,17 @@ export async function crawlSite(url: string) {
   const blogTitles: string[] = []
 
   for (const page of res.data) {
-    const path = new URL(page.metadata.sourceURL).pathname
+    const sourceURL = page.metadata?.sourceURL
+    if (!sourceURL) continue
+    const path = new URL(sourceURL).pathname
     if (
       /(about|home|index|pricing|features?|solutions?)/i.test(path) ||
       path === "/" ||
       path === ""
     )
-      productPages.push(page.markdown)
+      productPages.push(page.markdown ?? "")
     else if (/\/blog\//i.test(path))
-      blogTitles.push(page.metadata.title ?? "")
+      blogTitles.push(page.metadata?.title ?? "")
   }
 
   return { productPagesMarkdown: productPages.join("\n\n"), blogTitles }
@@ -31,6 +41,7 @@ export async function crawlSite(url: string) {
 /* ───────────────────────── Low-level helpers ──────────────────── */
 
 async function scrape(url: string): Promise<string> {
+  const app = getFirecrawlApp()
   const res = await app.scrapeUrl(url, { formats: ["markdown"], timeout: 60_000 })
   return res.success ? res.markdown ?? "" : ""
 }

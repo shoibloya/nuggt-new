@@ -270,10 +270,7 @@ export default function AdversarialSeoAnalysis() {
                               <span className="truncate mr-2">{kw}</span>
                               <div className="flex items-center">
                                 {cluster.ranking[i] === "1" ? (
-                                  <Badge
-                                    variant="success"
-                                    className="bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-100"
-                                  >
+                                  <Badge className="bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-100">
                                     P1
                                   </Badge>
                                 ) : cluster.ranking[i] === "2" ? (
